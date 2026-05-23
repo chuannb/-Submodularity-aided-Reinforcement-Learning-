@@ -34,7 +34,105 @@ Model tốt hơn random ~33×, nhưng còn xa SOTA (SASRec ~5–15%).
 
 ---
 
-## 2. Dataset chuẩn các paper benchmark
+## 2. Benchmark numbers — các model có thể so sánh
+
+> Nguồn: ICSRec (WSDM 2024 Oral, [arxiv:2310.14318](https://arxiv.org/abs/2310.14318))  
+> Evaluation protocol: **leave-one-out** (last item làm test), **full ranking** (không sample negatives)  
+> Dataset: Amazon 2014 5-core
+
+### Amazon Beauty (22K users, 12K items)
+
+| Model | HR@10 | NDCG@10 | Ghi chú |
+|-------|------:|--------:|---------|
+| BPR | 0.0296 | 0.0147 | MF baseline |
+| GRU4Rec | 0.0284 | 0.0150 | RNN-based |
+| Caser | 0.0342 | 0.0226 | CNN-based |
+| **SASRec** | **0.0624** | **0.0342** | Transformer causal |
+| **BERT4Rec** | **0.0601** | **0.0300** | Transformer bidirectional |
+| CL4SRec | 0.0642 | 0.0345 | SASRec + contrastive |
+| CoSeRec | 0.0725 | 0.0410 | augmentation-based |
+| DuoRec | 0.0851 | 0.0441 | structural contrastive |
+| ICLRec | 0.0744 | 0.0403 | intent contrastive |
+| IOCRec | 0.0774 | 0.0396 | — |
+| **ICSRec** | **0.0960** | **0.0579** | SOTA contrastive (2024) |
+| *Bạn (hiện tại)* | *0.0100* | *0.0100* | full Amazon, 2.6M items |
+
+### Amazon Sports (35K users, 18K items)
+
+| Model | HR@10 | NDCG@10 |
+|-------|------:|--------:|
+| GRU4Rec | 0.0258 | 0.0142 |
+| Caser | 0.0261 | 0.0135 |
+| **SASRec** | **0.0333** | **0.0177** |
+| **BERT4Rec** | **0.0359** | **0.0190** |
+| CL4SRec | 0.0369 | 0.0191 |
+| CoSeRec | 0.0439 | 0.0244 |
+| DuoRec | 0.0466 | 0.0244 |
+| ICLRec | 0.0437 | 0.0238 |
+| **ICSRec** | **0.0565** | **0.0335** |
+
+### Amazon Toys (19K users, 12K items)
+
+| Model | HR@10 | NDCG@10 |
+|-------|------:|--------:|
+| GRU4Rec | 0.0184 | 0.0097 |
+| Caser | 0.0333 | 0.0168 |
+| **SASRec** | **0.0652** | **0.0320** |
+| **BERT4Rec** | **0.0524** | **0.0309** |
+| CoSeRec | 0.0755 | 0.0442 |
+| DuoRec | 0.0959 | 0.0490 |
+| **ICSRec** | **0.1055** | **0.0657** |
+
+### MovieLens-1M (6K users, 3.7K items)
+
+| Model | HR@10 | NDCG@10 |
+|-------|------:|--------:|
+| GRU4Rec | 0.1344 | 0.0649 |
+| Caser | 0.1442 | 0.0734 |
+| **SASRec** | **0.1810** | **0.0948** |
+| **BERT4Rec** | **0.2219** | **0.1097** |
+| DuoRec | 0.3078 | 0.1749 |
+| **ICSRec** | **0.3368** | **0.2007** |
+
+### Beauty — semantic/LLM models (nguồn: LIGER, [arxiv:2411.18814](https://arxiv.org/abs/2411.18814))
+
+| Model | NDCG@10 | Recall@10 | Ghi chú |
+|-------|--------:|----------:|---------|
+| SASRec | 0.0218 | 0.0511 | ID-based, cold-start = 0 |
+| UniSRec | 0.0335 | 0.0694 | text-based |
+| RecFormer | 0.0288 | 0.0627 | text-based |
+| TIGER | 0.0322 | 0.0601 | generative |
+| **LIGER** | **0.0402** | **0.0745** | generative+dense |
+
+> Note: Con số SASRec ở đây thấp hơn bảng trên vì dùng evaluation protocol khác (temporal split, full ranking trên toàn catalog kể cả cold-start items).
+
+### Diversity metrics (nguồn: TRIER, ACM TOIS 2024; CatDive, PLOS ONE 2025)
+
+TRIER report cải thiện so với SASRec baseline:
+- Steam: ILD@5 tăng **+11.36%**
+- Yelp: ILD@5 tăng **+3.43%**, HR@5 tăng **+7.62%**, NDCG@5 tăng **+8.63%**
+- Beauty: CC@5 (Category Coverage) tăng **+3.77%**
+
+CatDive (Amazon Books, Kindle — khác dataset nhưng có ILD):
+- SASRec baseline: HR@10=0.1477, NDCG@10=0.0807, ILD@10≈0.514, Coverage@10≈0.101
+- CatDive: HR@10=0.1938 (+31%), NDCG@10=0.1066 (+32%), ILD@10=0.5947 (+15.6%), Cov@10=0.1213 (+20%)
+
+---
+
+### Mục tiêu cần đạt để paper competitive
+
+| Dataset | Hit@10 baseline (SASRec) | Mục tiêu tối thiểu | SOTA (2024) |
+|---------|------------------------:|------------------:|------------:|
+| Beauty | 0.0624 | **≥ 0.0624** + ILD cao hơn | 0.0960 (ICSRec) |
+| Sports | 0.0333 | **≥ 0.0333** + ILD cao hơn | 0.0565 (ICSRec) |
+| Toys | 0.0652 | **≥ 0.0652** + ILD cao hơn | 0.1055 (ICSRec) |
+| ML-1M | 0.1810 | **≥ 0.1810** + ILD cao hơn | 0.3368 (ICSRec) |
+
+> Paper của bạn không cần beat ICSRec về accuracy. Claim là: **với accuracy tương đương SASRec, hệ thống đạt diversity (ILD) cao hơn đáng kể** — đây là trade-off mà accuracy-only models không tối ưu.
+
+---
+
+## 3. Dataset chuẩn các paper benchmark
 
 Số liệu xác thực từ [RecSys 2024 — "Does It Look Sequential?"](https://arxiv.org/pdf/2408.12008):
 

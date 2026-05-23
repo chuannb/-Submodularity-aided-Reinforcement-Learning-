@@ -208,15 +208,25 @@ def proxy_reward_amazon(
     slate: List[int],
     target: int,
     stars: Optional[float] = None,
+    rank_bonus: float = 0.2,
+    miss_penalty: float = -0.01,
 ) -> float:
     """
-    Amazon: hit@k weighted by stars.
-    r = (stars / 5.0) if target in slate else 0.0
+    Amazon: shaped reward = stars-weighted hit + rank bonus + miss penalty.
+
+    r_hit  = (stars/5) * (1 + rank_bonus * (k - rank) / k)
+    r_miss = miss_penalty   (small negative to push gradient away from 0)
+
+    rank_bonus pushes the model to place the target higher in the slate.
+    miss_penalty prevents pure-zero gradients on misses.
     """
     if target not in slate:
-        return 0.0
+        return miss_penalty
+    k = len(slate)
+    rank = slate.index(target)          # 0-indexed, lower = better position
     weight = (stars / 5.0) if stars is not None else 1.0
-    return float(weight)
+    position_bonus = rank_bonus * (k - 1 - rank) / k  # 0 at last, rank_bonus*(k-1)/k at first
+    return float(weight * (1.0 + position_bonus))
 
 
 def proxy_reward_retailrocket(

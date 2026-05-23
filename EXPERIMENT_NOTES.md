@@ -4,6 +4,15 @@ Branch: `exp-smaller-dataset` (fork từ `bert4rec-backbone`)
 
 ---
 
+## 0. Môi trường thực nghiệm
+
+- **GPU**: NVIDIA GeForce RTX 3090 (23 GB VRAM)
+- **Quy tắc**: Mọi lần chạy pipeline phải dùng `--device cuda` để có kết quả đủ nhanh
+- **Smoke test**: `--max_users 200 --epochs 1 --steps_per_epoch 50 --device cuda`
+- **Full run**: Không giới hạn max_users, ít nhất 5 epochs
+
+---
+
 ## 1. Vấn đề cốt lõi được xác định
 
 ### Root cause: Dataset quá lớn
@@ -255,8 +264,9 @@ Pipeline claim:
 
 ## 7. Việc cần làm trên branch này
 
-- [ ] Viết `data/beauty_loader.py` — load Amazon 2014 format (`reviewerID`, `asin`, `overall`, `unixReviewTime`)
-- [ ] Adapter `run_amazon.py` → `run_beauty.py` — chạy pipeline trên Beauty/Sports/Toys
+- [x] ~~Viết `data/beauty_loader.py`~~ — không cần, `amazon_loader.py` đã xử lý đúng format 2014 (`reviewerID`, `asin`, `overall`, `unixReviewTime`). `build_meta_from_reviews()` tự tạo catalog khi không có meta file.
+- [x] ~~Dataset verify~~ — tất cả 4 dataset khớp với paper (Beauty: 22,363u/12,101i, Sports: 35,598u/18,357i, Toys: 19,412u/11,924i, ML-1M: 6,040u/3,706i)
+- [ ] Adapter `run_amazon.py` → `run_beauty.py` — chạy pipeline trên Beauty/Sports/Toys với defaults phù hợp
 - [ ] Benchmark BERT4Rec standalone trên Beauty 2014 → lấy số recall@k baseline
 - [ ] Benchmark SASRec standalone trên Beauty 2014
 - [ ] Chạy full pipeline (BERT4Rec → Reranker → Submodular+RL) trên Beauty 2014
@@ -268,17 +278,21 @@ Pipeline claim:
 ## 8. Bugs cần fix trước khi chạy (từ REPORT.md)
 
 ```python
-# algorithms/unified_trainer.py, dòng 332
-# BUG: next_state dùng state hiện tại thay vì state thực của bước tiếp theo
-next_state=trans_dict["state"],   # SAI — phải là next step's actual state
-
-# FIX cần implement:
-# Khi build trajectory, lưu next_state = encode(history[t+1])
+# algorithms/unified_trainer.py, dòng 346-353
+# ĐÃ FIX: next_state được tính đúng từ history[t+1]
+next_hist = (step.history_ids + [step.item_id])[-self.pipeline.history_length:]
+next_state = self.pipeline.encode_state(next_hist, next_ext)  # ĐÚNG
 ```
 
-Sparse reward fix:
+- [x] ~~`next_state` bug~~ — ĐÃ FIX trong unified_trainer.py dòng 348-353
+
+Sparse reward fix (chưa implement):
 ```python
-# Thay vì: r_t = stars/5 if hit else 0
-# Dùng shaped reward:
-r_t = (stars/5) * (1 + rank_bonus * (k - rank_in_slate) / k)  if hit else -0.01
+# HIỆN TẠI (trajectory_builder.py):
+r_t = (stars / 5.0) if target in slate else 0.0   # không có penalty, không có rank bonus
+
+# CẦN SỬA THÀNH:
+r_t = (stars/5) * (1 + 0.2 * (k - rank_in_slate) / k)  if hit else -0.01
 ```
+
+- [ ] Fix sparse reward — cần implement shaped reward với miss penalty (-0.01) và rank bonus

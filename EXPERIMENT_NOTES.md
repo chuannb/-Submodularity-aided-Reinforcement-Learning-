@@ -162,7 +162,7 @@ Số liệu xác thực từ [RecSys 2024 — "Does It Look Sequential?"](https:
 
 ---
 
-## 3. Dataset đã tải về
+## 3b. Dataset đã tải về
 
 ```
 /workspace/datasets/
@@ -264,13 +264,13 @@ Pipeline claim:
 
 ## 7. Việc cần làm trên branch này
 
-- [x] ~~Viết `data/beauty_loader.py`~~ — không cần, `amazon_loader.py` đã xử lý đúng format 2014 (`reviewerID`, `asin`, `overall`, `unixReviewTime`). `build_meta_from_reviews()` tự tạo catalog khi không có meta file.
+- [x] ~~Viết `data/beauty_loader.py`~~ — không cần, `amazon_loader.py` đã xử lý đúng format 2014.
 - [x] ~~Dataset verify~~ — tất cả 4 dataset khớp với paper (Beauty: 22,363u/12,101i, Sports: 35,598u/18,357i, Toys: 19,412u/11,924i, ML-1M: 6,040u/3,706i)
-- [ ] Adapter `run_amazon.py` → `run_beauty.py` — chạy pipeline trên Beauty/Sports/Toys với defaults phù hợp
-- [ ] Benchmark BERT4Rec standalone trên Beauty 2014 → lấy số recall@k baseline
+- [x] ~~Adapter `run_amazon.py` → `run_beauty.py`~~ — đã tạo `run_beauty.py` (legacy BM25 mode) và `run_beauty_bert4rec.py` (BERT4Rec mode — **recommended**)
+- [ ] Chạy full 100-epoch Beauty 2014 với BERT4Rec pipeline → lấy số hit@10, ndcg@10, ILD
 - [ ] Benchmark SASRec standalone trên Beauty 2014
-- [ ] Chạy full pipeline (BERT4Rec → Reranker → Submodular+RL) trên Beauty 2014
-- [ ] So sánh ILD, Hit@10, NDCG@10, Coverage với baselines
+- [ ] So sánh ILD, Hit@10, NDCG@10, Coverage với baselines (SASRec, BERT4Rec-only)
+- [ ] Chạy Sports + Toys sau khi Beauty converge
 - [ ] Tải meta_Beauty.json.gz nếu cần DPO pairs (also_buy/also_view)
 
 ---
@@ -285,14 +285,277 @@ next_state = self.pipeline.encode_state(next_hist, next_ext)  # ĐÚNG
 ```
 
 - [x] ~~`next_state` bug~~ — ĐÃ FIX trong unified_trainer.py dòng 348-353
+- [x] ~~Sparse reward~~ — ĐÃ FIX trong trajectory_builder.py `proxy_reward_amazon()`:
 
-Sparse reward fix (chưa implement):
 ```python
-# HIỆN TẠI (trajectory_builder.py):
-r_t = (stars / 5.0) if target in slate else 0.0   # không có penalty, không có rank bonus
-
-# CẦN SỬA THÀNH:
-r_t = (stars/5) * (1 + 0.2 * (k - rank_in_slate) / k)  if hit else -0.01
+# ĐÃ FIX (trajectory_builder.py):
+def proxy_reward_amazon(slate, target, stars=None, rank_bonus=0.2, miss_penalty=-0.01):
+    if target not in slate:
+        return miss_penalty                              # -0.01: gradient âm nhỏ khi miss
+    k    = len(slate)
+    rank = slate.index(target)                          # 0-indexed, thấp = vị trí tốt hơn
+    weight         = (stars / 5.0) if stars else 1.0
+    position_bonus = rank_bonus * (k - 1 - rank) / k   # 0 ở vị trí cuối, max ở đầu
+    return float(weight * (1.0 + position_bonus))
 ```
 
-- [ ] Fix sparse reward — cần implement shaped reward với miss penalty (-0.01) và rank bonus
+- [x] ~~**Bug trong trainer** (`unified_trainer.py` dòng 334–335)~~: khi `step.reward is not None`,
+  trainer dùng binary hit/miss thay vì shaped reward — ĐÃ FIX, nay luôn gọi `proxy_reward_amazon()`
+  với `stars = step.reward * 5` (xem Section 9 để hiểu lý do).
+
+---
+
+## 9. History length và Reward function — Design decisions
+
+### 9.1 History length — nên dùng bao nhiêu item?
+
+Các paper benchmark trên Amazon 2014 5-core đều dùng **20–50 item gần nhất**, không phải 5:
+
+| Paper | maxlen (Beauty/Sports/Toys) | Ghi chú |
+|-------|-----------------------------|---------|
+| SASRec (Tang & Wang 2018) | **50** | Causal transformer |
+| BERT4Rec (Sun et al. 2019) | **50–200** | Bidirectional, thường dùng 50 |
+| S3-Rec (AAAI 2021) | **50** | Self-supervised pre-training |
+| GRU4Rec | **20** | RNN, ít ổn định hơn |
+| REINFORCE-Rec (Chen et al. 2019) | **50** | RL-based |
+| SQN (Xin et al. 2020, SIGIR) | **10–20** | RL state = GRU(last 10) |
+
+**Quyết định cho pipeline này:**
+- **StateEncoder (RL policy)**: `history_length = 20` — đủ context, không quá nặng
+- **BERT4Rec retriever**: `maxlen = 50` — nhiều context hơn cho recall tốt hơn
+- **Không dùng "5 item gần nhất"** — không có paper nào làm vậy, quá ít context
+
+### 9.2 Reward function — các paper dùng gì?
+
+**Ngữ cảnh**: Amazon 5-core là **explicit feedback** — toàn bộ tương tác đều là sản phẩm user
+thực sự mua VÀ để lại đánh giá (selection bias: user chỉ review khi đủ quan tâm).
+
+| Paper | Dataset | Reward | Notes |
+|-------|---------|--------|-------|
+| **SQN** (Xin et al. 2020) | Amazon Beauty, Sports | Binary: r=1 nếu hit, 0 nếu không | Implicit feedback |
+| **REINFORCE-Rec** (Chen et al. 2019) | Taobao click log | r=click/no-click, purchase=higher | Multi-step env |
+| **KERL** (2020) | Amazon | Binary với threshold: rating≥4 → r=1 | Chặn negative reviews |
+| **CausalRec** (Yuan et al. 2021) | Amazon 5-core | r=1 nếu target trong top-K | Binary |
+| **RLREC** (Zhao et al. 2018) | MovieLens, LastFM | r = rating/max_rating nếu hit | Rating-weighted |
+
+**Phổ biến nhất**: binary hit (r=1) hoặc NDCG-style (r=1/log2(rank+2)).
+
+**Current approach (shaped reward):**
+```
+r_t = (stars/5) × (1 + 0.2×(k-1-rank)/k)  if hit   →  [0.2, 1.18]  range với k=10
+r_t = -0.01                                  if miss
+```
+Đây là rating-weighted + rank bonus — hợp lý nhưng phức tạp hơn cần thiết.
+
+**✅ Đã fix trong unified_trainer.py dòng 334–342:**
+```python
+# ĐÃ FIX:
+if step.reward is not None and dataset_type == "amazon":
+    # step.reward = target_rating/5 → dùng shaped reward với rating thực
+    reward = proxy_reward_amazon(slate, step.item_id, stars=step.reward * 5)
+elif step.reward is not None:
+    # Non-amazon (RetailRocket, ML-1M): giữ raw reward
+    reward = float(step.reward) if step.item_id in slate else 0.0
+elif dataset_type == "amazon":
+    # Legacy: không có target rating → proxy bằng last history star
+    stars = step.history_extras[-1] if step.history_extras else None
+    reward = proxy_reward_amazon(slate, step.item_id, stars * 5 if stars else None)
+```
+
+Khi build trajectories từ 5-core data, `step.reward = target_rating/5` → shaped reward đúng.
+
+**Kết luận — giữ shaped reward hay đổi sang binary?**
+
+Shaped reward (hiện tại, sau khi fix bug) hợp lý vì:
+1. Rating-weighted ưu tiên recommend item chất lượng cao
+2. Rank bonus tạo gradient để model học đặt target lên đầu slate
+3. Miss penalty (-0.01) ngăn pure-zero gradients
+
+**Không cần đổi sang binary** — fix bug là đủ.
+
+---
+
+## 10. BERT4Rec Pipeline — Implementation & Optimization
+
+### 10.1 Files được tạo mới
+
+| File | Mô tả |
+|------|-------|
+| `retrieval_models/bert4rec/train_5core.py` | BERT4Rec trainer đọc `reviews_5core.json.gz`, leave-last-2-out split, eval recall@K |
+| `retrieval/bert4rec_retriever.py` | Wrapper BERT4Rec+FAISS, sequential + **batched** search interface |
+| `retrieval/bert4rec_pipeline.py` | Drop-in thay `UnifiedPipeline`, dùng BERT4Rec thay BM25+Reranker, có `batch_evaluate()` |
+| `run_beauty_bert4rec.py` | End-to-end runner: BERT4Rec pretraining → RL training → eval |
+
+### 10.2 Tại sao bỏ BM25 + Qwen3-Reranker?
+
+3 vấn đề cốt lõi với BM25+Reranker trên Amazon 5-core:
+1. **Không có product metadata** — `build_meta_from_reviews()` dùng review summaries làm "title" → BM25 query meaningless
+2. **Train/eval distribution mismatch** — training dùng `fast_mode=True` (BM25 scores), eval dùng Qwen3-Reranker → RL policy train trên distribution A, eval trên distribution B → hit@10=0
+3. **Tốc độ** — Qwen3-Reranker 0.6B: ~2s/query → không thể train online
+
+BERT4Rec:
+- Không cần text metadata, chỉ cần interaction history
+- Train/eval cùng scorer (cosine similarity) → không mismatch
+- ~5ms/query (400x nhanh hơn Qwen3-Reranker)
+
+### 10.3 Indexing convention — BUG đã fix
+
+**Bug**: `RerankerBackedSubmodular(num_items=item_num)` tạo `Embedding(item_num)` với valid indices `0..item_num-1`. Nhưng BERT4Rec dùng **1-indexed** item_id (1..item_num), nên index `item_num` là out-of-bounds → CUDA assertion error.
+
+**Fix**: `num_items=item_num + 1` để accommodate 1-indexed ids. `StateEncoder` đã làm đúng (`Embedding(num_items+1, ..., padding_idx=0)`), submodular cần nhất quán.
+
+```python
+# ĐÚNG:
+submodular = RerankerBackedSubmodular(num_items=item_num + 1, ...)  # index 0=padding, 1..item_num=real
+state_encoder = StateEncoder(num_items=item_num, ...)               # StateEncoder đã tự +1 bên trong
+```
+
+### 10.4 GPU Optimization — Profiling results (RTX 3090, 23GB)
+
+**BERT4Rec training batch size** (hidden_dim=128, maxlen=50, 2 blocks):
+
+| Batch | VRAM | ms/batch | Ghi chú |
+|-------|------|----------|---------|
+| 512 | 0.87GB | 325ms | CUDA warmup lần đầu |
+| 1024 | **2.38GB** | **33ms** | **Sweet spot** ✓ |
+| 2048 | 7.33GB | 77ms | Tốn VRAM, logit matrix (M,M) lớn |
+| 4096 | OOM | — | InfoNCE (M,M) ~ 20K² floats = 1.6GB |
+
+Lý do InfoNCE tốn memory: logit matrix `(M, M)` trong `infonce_loss()`, với M = số masked positions trong batch. M ≈ B × maxlen × mask_prob. Tại B=1024: M ≈ 10K → matrix 400MB.
+
+**Eval bottleneck — sequential vs batched retrieval:**
+
+| Mode | ms/query | 22K users | Ghi chú |
+|------|----------|-----------|---------|
+| Sequential `search_by_history()` | 1.80ms | 40s/epoch | Current default |
+| Batched `batch_search_by_history()` | **0.04ms** | **0.9s/epoch** | **45x speedup** |
+| Greedy selector (unavoidable) | 1.68ms | 37s/epoch | Không thể batch |
+
+**Kết luận**: User embedding + FAISS có thể batch 45x faster, nhưng greedy selector vẫn là bottleneck (sequential, per-user). Tổng eval vẫn ~38s/epoch với 22K users.
+
+**Giải pháp thực tế**: `--eval_steps 2000` → cap eval tại 2000 users = 3.4s/epoch.
+
+### 10.5 Estimated runtime — Full Beauty run (22K users)
+
+| Component | Time |
+|-----------|------|
+| BERT4Rec pretraining (10 epochs, B=1024) | ~1 phút |
+| RL training (100 epochs × 2000 steps) | ~18 phút |
+| Eval (100 epochs × 2000 users) | ~6 phút |
+| **Tổng** | **~25 phút** |
+
+### 10.6 Command chuẩn cho full run
+
+```bash
+tmux new -s beauty100
+
+python run_beauty_bert4rec.py --dataset beauty \
+    --bert4rec_epochs 10 \
+    --bert4rec_batch 1024 \
+    --bert4rec_dim 128 \
+    --epochs 100 \
+    --steps_per_epoch 2000 \
+    --eval_steps 2000 \
+    --batch_size 256 \
+    --buffer_size 50000 \
+    --min_buffer 1000 \
+    --n_retrieve 200 \
+    --device cuda \
+    2>&1 | tee output_beauty_bert4rec/run_100ep.log
+
+# Detach: Ctrl+B D
+# Attach lại: tmux attach -t beauty100
+# Xem log: tail -f output_beauty_bert4rec/run_100ep.log
+```
+
+### 10.7 Smoke test kết quả (500 users, 3 BERT4Rec epochs, 2 RL epochs)
+
+```
+BERT4Rec recall@50 = 0.006  (500 users — quá ít để học 12K items)
+RL epoch 1: (warmup → losses bắt đầu)
+RL epoch 2: rl/critic_loss=0.41  actor_loss=0.73  sub/total=0.65
+Val hit@10 = 0.0020  coverage=0.054  ILD=1.047
+Test hit@10 = 0.0000  (expected — BERT4Rec recall quá thấp với 500 users)
+```
+
+Pipeline chạy không lỗi. Với full 22K users + 10 BERT4Rec epochs, BERT4Rec recall@50 dự kiến ~10-20%.
+
+---
+
+## 11. Phân tích training dynamics — Beauty 100 epoch
+
+### 11.1 Run 1: gamma=0.99, inject_target=True (FAILED — diverge)
+
+**Log**: `output_beauty_bert4rec/run_100ep.log`
+
+**Quan sát (CLAIM — có log làm bằng chứng):**
+- critic_loss tăng mũ không dừng: ep9=49 → ep14=628 → ep20=4017
+- actor_loss âm và tăng dần magnitude: -0.14 → -7.14
+- val hit@10 stuck 0.0035–0.0050 suốt 20 epoch
+
+**Nguyên nhân (CLAIM):**
+- inject_target → training hit_rate ~91% → reward trung bình ≈ 0.91
+- V* = r/(1-γ) = 0.91/0.01 = **91** — quá lớn
+- Critic bootstrap target tăng nhanh hơn critic có thể học (gradient clipping 1.0 giới hạn step size)
+- Kết quả: divergence thật, không phải bootstrapping bình thường
+
+**Kết luận**: gamma=0.99 không phù hợp với reward scale hiện tại khi có inject_target.
+
+---
+
+### 11.2 Run 2: gamma=0.9, inject_target=True (PARTIAL — actor collapse)
+
+**Log**: `output_beauty_bert4rec/run_100ep_g09.log`
+**Thay đổi**: `--gamma 0.9` (default mới trong run_beauty_bert4rec.py)
+
+**Quan sát (CLAIM — có log làm bằng chứng):**
+- critic_loss không diverge: peak ở ep~55 (~110), giảm dần về ~70 ở ep80 ✓
+- actor pg_loss: oscillate gần 0 suốt từ ep1 (-0.01 đến +0.08)
+- sub/reinforce_loss: flat 0.31–0.32 suốt 80 epoch (không học)
+- val hit@10: stuck 0.003–0.005
+
+**Cơ chế actor collapse (CLAIM):**
+```
+inject_target → reward ≈ 0.91 uniform
+critic hội tụ → V_pred → V* ≈ 9.1 cho mọi state
+advantage = target - V_pred ≈ 9.1 - 9.1 ≈ 0
+pg_loss = -mean(log_prob × advantage) ≈ 0
+→ actor không nhận gradient có nghĩa
+```
+
+**Kết luận**: gamma=0.9 fix divergence nhưng lộ ra vấn đề sâu hơn: inject_target tạo reward uniform → advantages ≈ 0 → actor/submodular không học được.
+
+---
+
+### 11.3 Run 3: gamma=0.9, inject_target=False + advantage normalization (EXPERIMENT)
+
+**Log**: `output_beauty_bert4rec/run_100ep_noinject.log`
+
+**Thay đổi code:**
+1. `unified_trainer.py`: `inject_target=True` → `inject_target=False`
+2. `unified_pipeline.py`: thêm advantage normalization:
+   ```python
+   advantages = targets - v_pred.detach()
+   advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+   ```
+
+**Hypothesis (EXPERIMENT — chưa có bằng chứng):**
+- Training hit_rate giảm xuống ~35-40% (BERT4Rec recall@200 thực)
+- Reward không còn uniform → advantages có variance thực → actor học được
+- Advantage normalization đảm bảo gradient ổn định dù reward sparse
+- V* = 0.4 × 0.91 / 0.1 ≈ 3.6 — critic converge nhanh hơn
+- val hit@10 tăng rõ so với Run 2 (nếu hypothesis đúng)
+
+**Nếu val hit@10 vẫn stuck**: bottleneck là BERT4Rec recall@10 ceiling, không phải RL.
+**Nếu val hit@10 tăng**: inject_target là nguyên nhân chính gây actor collapse.
+
+**Command:**
+```bash
+python run_beauty_bert4rec.py --dataset beauty \
+    --skip_bert4rec \
+    --bert4rec_batch 1024 --bert4rec_dim 128 \
+    --epochs 100 --steps_per_epoch 2000 --eval_steps 2000 \
+    --batch_size 1024 --buffer_size 200000 --min_buffer 2000 \
+    --n_retrieve 200 --device cuda \
+    2>&1 | tee output_beauty_bert4rec/run_100ep_noinject.log
+```

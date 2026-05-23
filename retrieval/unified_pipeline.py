@@ -136,7 +136,8 @@ class UnifiedRLPolicy(torch.nn.Module):
         self.critic_opt.step()
 
         new_actions, log_probs = self.actor.sample(states)
-        advantages = (targets - v_pred.detach())
+        advantages = targets - v_pred.detach()
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         pg_loss = -(log_probs * advantages).mean()
         bc_loss = F.mse_loss(new_actions, actions)
         actor_loss = pg_loss + bc_coeff * bc_loss

@@ -320,7 +320,7 @@ class UnifiedJointTrainer:
                 reward=0.0,
                 dataset_type=dataset_type,
                 fast_mode=fast_mode,
-                inject_target=True,
+                inject_target=False,
             )
             t_bm25 += (time.perf_counter() - _t) * 1000
 
@@ -331,9 +331,16 @@ class UnifiedJointTrainer:
 
             # ── Reward ───────────────────────────────────────────────────
             _t = time.perf_counter()
-            if step.reward is not None:
+            if step.reward is not None and dataset_type == "amazon":
+                # step.reward = target_rating/5 (from 5-core or V2 builder)
+                # Apply shaped reward: rank bonus + miss penalty
+                reward = proxy_reward_amazon(slate, step.item_id,
+                                             stars=step.reward * 5)
+            elif step.reward is not None:
+                # Non-amazon datasets (RetailRocket, ML-1M): use raw reward
                 reward = float(step.reward) if step.item_id in slate else 0.0
             elif dataset_type == "amazon":
+                # Legacy path: no explicit target rating, proxy with last history star
                 stars = step.history_extras[-1] if step.history_extras else None
                 reward = proxy_reward_amazon(slate, step.item_id,
                                              stars * 5 if stars is not None else None)
@@ -429,21 +436,28 @@ class UnifiedJointTrainer:
             _tqdm = None
 
         self.metrics.reset()
-        iterator = (
-            _tqdm(eval_steps, desc="  eval", unit="step", dynamic_ncols=True)
-            if _tqdm else eval_steps
-        )
-        for step in iterator:
-            query = pipeline_query_fn(step)
-            results, _ = self.pipeline.search(
-                query=query,
-                history_ids=step.history_ids,
-                history_extras=step.history_extras,
-                budget=step.budget,
-                deterministic=True,
+
+        # Fast path: BERT4RecPipeline has batch_evaluate() → ~2x speedup
+        if hasattr(self.pipeline, "batch_evaluate"):
+            slates = self.pipeline.batch_evaluate(eval_steps, retrieval_batch_size=512)
+            for step, slate in zip(eval_steps, slates):
+                self.metrics.update(slate, step.item_id)
+        else:
+            iterator = (
+                _tqdm(eval_steps, desc="  eval", unit="step", dynamic_ncols=True)
+                if _tqdm else eval_steps
             )
-            slate = [r.item_idx for r in results]
-            self.metrics.update(slate, step.item_id)
+            for step in iterator:
+                query = pipeline_query_fn(step)
+                results, _ = self.pipeline.search(
+                    query=query,
+                    history_ids=step.history_ids,
+                    history_extras=step.history_extras,
+                    budget=step.budget,
+                    deterministic=True,
+                )
+                slate = [r.item_idx for r in results]
+                self.metrics.update(slate, step.item_id)
 
         num_items = self.sub.item_emb.num_embeddings
         return self.metrics.compute(num_items)

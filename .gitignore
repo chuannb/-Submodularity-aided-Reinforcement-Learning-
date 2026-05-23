@@ -4,3 +4,8 @@
 *.json
 *.png
 *.jsonl
+
+# Training outputs
+__pycache__/
+output_*/
+retrieval_models/bert4rec/output_*/

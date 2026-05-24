@@ -1,13 +1,10 @@
 
-
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
 
-from data.amazon_loader import AmazonDataset
-from data.retailrocket_loader import RetailRocketDataset
 from utils.encoders import StateEncoder, encode_history
 
 
@@ -33,79 +30,59 @@ class TrajectoryStep:
 # Algorithm 1 implementation
 # ---------------------------------------------------------------------------
 
-def build_trajectories_amazon(
-    dataset: AmazonDataset,
-    split: str = "train",
+
+def build_trajectories_v2(
+    samples: list,
+    item2id: dict,
+    price_map: dict,
+    history_length: int = 20,
+    slate_size: int = 10,
 ) -> List[TrajectoryStep]:
     """
-    Build trajectory steps from Amazon Product Review dataset.
+    Build trajectory steps from V2 pre-split dataset.
 
-    Input  : lịch sử review trước và metadata của các sản phẩm đã mua
-    Output : sản phẩm được review hoặc mua ở các thời điểm sau  (y_t)
+    Each sample dict:
+      user_id, history:[{asin, stars, ts}], target_asin,
+      target_stars, r_hit (user-normalized reward), user_mean_stars, ts
+
+    r_hit is stored in step.reward for direct use during training.
+    Budget = mean_price * slate_size so greedy can always fill a full slate.
+    Falls back to slate_size when no price data is available.
     """
     steps: List[TrajectoryStep] = []
-    for sample in dataset:
-        if sample["split"] != split:
-            continue
-        steps.append(TrajectoryStep(
-            user_id=sample["user_id"],
-            item_id=sample["item_id"],
-            history_ids=sample["history_ids"],
-            history_extras=sample["history_stars"],
-            budget=sample["budget"],
-            split=split,
-            reward=None,   # proxy: hit@k weighted by stars (computed during training)
-        ))
-    return steps
-
-
-def build_trajectories_retailrocket(
-    dataset: RetailRocketDataset,
-    split: str = "train",
-) -> List[TrajectoryStep]:
-    """
-    Build trajectory steps from RetailRocket dataset.
-
-    Input  : chuỗi tương tác trước đó (view, add-to-cart, transaction) + category
-    Output : sản phẩm + event tiếp theo  (y_t)
-    """
-    steps: List[TrajectoryStep] = []
-    for sample in dataset:
-        if sample["split"] != split:
+    for rec in samples:
+        target_asin = rec.get("target_asin", "")
+        if not target_asin or target_asin not in item2id:
             continue
 
-        # Map event strings to weights as history extras
-        event_weights = [
-            {"view": 0.1, "addtocart": 0.5, "transaction": 1.0}.get(e, 0.1)
-            for e in sample["history_events"]
-        ]
+        target_id = item2id[target_asin]
+        history   = rec.get("history", [])
+
+        # Trim to history_length most recent
+        history = history[-history_length:]
+
+        history_ids   = [item2id[h["asin"]] for h in history if h.get("asin") in item2id]
+        history_stars = [float(h.get("stars", 3)) / 5.0 for h in history if h.get("asin") in item2id]
+
+        if not history_ids:
+            continue
+
+        # Budget = mean price * slate_size so full slate is affordable.
+        # Without this, budget=1.0 with uniform costs=1.0 limits slate to 1 item.
+        prices = [price_map.get(i, 0.0) for i in history_ids]
+        valid  = [p for p in prices if p > 0]
+        budget = float(np.mean(valid)) * slate_size if valid else float(slate_size)
+
         steps.append(TrajectoryStep(
-            user_id=sample["user_id"],
-            item_id=sample["item_id"],
-            history_ids=sample["history_ids"],
-            history_extras=event_weights,
-            budget=float(sample["budget"]),
-            split=split,
-            event=sample["event"],
-            reward=sample["reward"],
+            user_id       = rec.get("user_id", ""),
+            item_id       = target_id,
+            history_ids   = history_ids,
+            history_extras= history_stars,
+            budget        = budget,
+            split         = "train",   # caller sets correct split label
+            reward        = float(rec.get("r_hit", 0.5)),
         ))
     return steps
-
-
-def build_trajectories(
-    dataset,
-    split: str = "train",
-) -> List[TrajectoryStep]:
-    """
-    Dispatch to the correct builder based on dataset type.
-    Implements Algorithm 1 from the paper.
-    """
-    if isinstance(dataset, AmazonDataset):
-        return build_trajectories_amazon(dataset, split)
-    elif isinstance(dataset, RetailRocketDataset):
-        return build_trajectories_retailrocket(dataset, split)
-    else:
-        raise ValueError(f"Unsupported dataset type: {type(dataset)}")
 
 
 # ---------------------------------------------------------------------------
@@ -154,15 +131,25 @@ def proxy_reward_amazon(
     slate: List[int],
     target: int,
     stars: Optional[float] = None,
+    rank_bonus: float = 0.2,
+    miss_penalty: float = -0.01,
 ) -> float:
     """
-    Amazon: hit@k weighted by stars.
-    r = (stars / 5.0) if target in slate else 0.0
+    Amazon: shaped reward = stars-weighted hit + rank bonus + miss penalty.
+
+    r_hit  = (stars/5) * (1 + rank_bonus * (k - rank) / k)
+    r_miss = miss_penalty   (small negative to push gradient away from 0)
+
+    rank_bonus pushes the model to place the target higher in the slate.
+    miss_penalty prevents pure-zero gradients on misses.
     """
     if target not in slate:
-        return 0.0
+        return miss_penalty
+    k = len(slate)
+    rank = slate.index(target)          # 0-indexed, lower = better position
     weight = (stars / 5.0) if stars is not None else 1.0
-    return float(weight)
+    position_bonus = rank_bonus * (k - 1 - rank) / k  # 0 at last, rank_bonus*(k-1)/k at first
+    return float(weight * (1.0 + position_bonus))
 
 
 def proxy_reward_retailrocket(

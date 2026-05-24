@@ -1,13 +1,10 @@
 
-
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
 
-from data.amazon_loader import AmazonDataset
-from data.retailrocket_loader import RetailRocketDataset
 from utils.encoders import StateEncoder, encode_history
 
 
@@ -32,64 +29,6 @@ class TrajectoryStep:
 # ---------------------------------------------------------------------------
 # Algorithm 1 implementation
 # ---------------------------------------------------------------------------
-
-def build_trajectories_amazon(
-    dataset: AmazonDataset,
-    split: str = "train",
-) -> List[TrajectoryStep]:
-    """
-    Build trajectory steps from Amazon Product Review dataset.
-
-    Input  : lịch sử review trước và metadata của các sản phẩm đã mua
-    Output : sản phẩm được review hoặc mua ở các thời điểm sau  (y_t)
-    """
-    steps: List[TrajectoryStep] = []
-    for sample in dataset:
-        if sample["split"] != split:
-            continue
-        steps.append(TrajectoryStep(
-            user_id=sample["user_id"],
-            item_id=sample["item_id"],
-            history_ids=sample["history_ids"],
-            history_extras=sample["history_stars"],
-            budget=sample["budget"],
-            split=split,
-            reward=None,   # proxy: hit@k weighted by stars (computed during training)
-        ))
-    return steps
-
-
-def build_trajectories_retailrocket(
-    dataset: RetailRocketDataset,
-    split: str = "train",
-) -> List[TrajectoryStep]:
-    """
-    Build trajectory steps from RetailRocket dataset.
-
-    Input  : chuỗi tương tác trước đó (view, add-to-cart, transaction) + category
-    Output : sản phẩm + event tiếp theo  (y_t)
-    """
-    steps: List[TrajectoryStep] = []
-    for sample in dataset:
-        if sample["split"] != split:
-            continue
-
-        # Map event strings to weights as history extras
-        event_weights = [
-            {"view": 0.1, "addtocart": 0.5, "transaction": 1.0}.get(e, 0.1)
-            for e in sample["history_events"]
-        ]
-        steps.append(TrajectoryStep(
-            user_id=sample["user_id"],
-            item_id=sample["item_id"],
-            history_ids=sample["history_ids"],
-            history_extras=event_weights,
-            budget=float(sample["budget"]),
-            split=split,
-            event=sample["event"],
-            reward=sample["reward"],
-        ))
-    return steps
 
 
 def build_trajectories_v2(
@@ -144,22 +83,6 @@ def build_trajectories_v2(
             reward        = float(rec.get("r_hit", 0.5)),
         ))
     return steps
-
-
-def build_trajectories(
-    dataset,
-    split: str = "train",
-) -> List[TrajectoryStep]:
-    """
-    Dispatch to the correct builder based on dataset type.
-    Implements Algorithm 1 from the paper.
-    """
-    if isinstance(dataset, AmazonDataset):
-        return build_trajectories_amazon(dataset, split)
-    elif isinstance(dataset, RetailRocketDataset):
-        return build_trajectories_retailrocket(dataset, split)
-    else:
-        raise ValueError(f"Unsupported dataset type: {type(dataset)}")
 
 
 # ---------------------------------------------------------------------------

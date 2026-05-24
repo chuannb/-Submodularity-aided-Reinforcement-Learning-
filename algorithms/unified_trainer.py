@@ -43,7 +43,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.submodular import RerankerBackedSubmodular
-from retrieval.unified_pipeline import UnifiedPipeline, UnifiedRLPolicy
+from retrieval.unified_pipeline import UnifiedRLPolicy
 from utils.metrics import SlateMetrics
 
 

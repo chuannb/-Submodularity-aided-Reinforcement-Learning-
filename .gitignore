@@ -9,3 +9,6 @@
 __pycache__/
 output_*/
 retrieval_models/bert4rec/output_*/
+
+# Logs, reports, scratch notes
+stuff/

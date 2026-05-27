@@ -1,59 +1,52 @@
 """
-BERT4RecPipeline
-================
+TwoStageRLPipeline
+==================
 
-Full recommendation pipeline: BERT4Rec dense retrieval → Submodular RL → Slate.
+Full recommendation pipeline: Retrieval Stage → Submodular RL Reranking → Slate.
 
 Pipeline flow:
-    User history → BERT4Rec (ANN recall, cosine-similarity scores)
+    User history → Retriever (ANN recall or search)
                  → RL policy  (outputs α_t, η_t)
                  → Submodular greedy selector (F_θ(S | α_t))
                  → Slate S_t  (k items)
 
 Stage mapping:
-    Stage 1 — retrieval:  BERT4RecRetriever (FAISS inner-product, top-m candidates)
-    Stage 2 — scoring:    retriever similarity scores used directly as r_u(i)
-    Stage 3 — selection:  actor-critic outputs (α_t, η_t); greedy builds slate
-
-Drop-in replacement for UnifiedPipeline.  Exposes the same interface:
-    search(...)             → List[UnifiedSearchResult]
-    collect_transition(...) → dict (replay buffer entry)
-    encode_state(...)       → np.ndarray
+    Stage 1 — retrieval:  Generic Retriever (must implement search_by_history)
+    Stage 2 — selection:  actor-critic outputs (α_t, κ_t); submodular greedy builds slate
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 
 from algorithms.greedy_selector import budgeted_submodular_greedy_reranker
 from models.submodular import RerankerBackedSubmodular
-from retrieval.bert4rec_retriever import BERT4RecRetriever
 from retrieval.unified_pipeline import ScoredCandidate, UnifiedRLPolicy, UnifiedSearchResult
 from utils.encoders import StateEncoder, pad_history
 
 
-class BERT4RecPipeline:
+class TwoStageRLPipeline:
     """
-    Wires BERT4RecRetriever, RerankerBackedSubmodular, and UnifiedRLPolicy
+    Wires a Retriever, RerankerBackedSubmodular, and UnifiedRLPolicy
     into a single search/training interface.
 
-    The RL policy outputs a 2-D action (α_t, η_t):
+    The RL policy outputs a 2-D action (α_t, κ_t):
         α_t — relevance-diversity trade-off weight in F_θ(S | α_t)
-        η_t — training-time exploration intensity (ε-greedy + softmax temperature)
+        κ_t — training-time exploration intensity (ε-greedy + softmax temperature)
     """
 
     def __init__(
         self,
-        retriever: BERT4RecRetriever,
+        retriever: Any,                       # Must implement search_by_history
         submodular: RerankerBackedSubmodular,
         rl_policy: UnifiedRLPolicy,
         state_encoder: StateEncoder,
         item_id_map: Dict[str, int],          # str_id → int_idx (1-indexed; 0 = padding)
         device: torch.device = torch.device("cpu"),
-        top_m: int = 200,                     # candidate pool size (m in the paper)
+        n_retrieve: int = 200,                # candidate pool size (m in the paper)
         slate_size: int = 10,                 # final slate size k
         history_length: int = 20,             # user history window h
         item_costs: Optional[Dict[int, float]] = None,
@@ -65,7 +58,7 @@ class BERT4RecPipeline:
         self.item_id_map    = item_id_map
         self.item_idx_map   = {v: k for k, v in item_id_map.items()}   # int_idx → str_id
         self.device         = device
-        self.top_m          = top_m
+        self.n_retrieve     = n_retrieve
         self.slate_size     = slate_size
         self.history_length = history_length
         self.item_costs     = item_costs or {}
@@ -98,8 +91,8 @@ class BERT4RecPipeline:
         return candidates
 
     def _retrieve(self, history_ids: List[int]) -> List[ScoredCandidate]:
-        """Stage 1: BERT4Rec ANN recall → sorted candidate list."""
-        raw = self.retriever.search_by_history(history_ids, top_k=self.top_m)
+        """Stage 1: ANN recall → sorted candidate list."""
+        raw = self.retriever.search_by_history(history_ids, top_k=self.n_retrieve)
         return self._parse_candidates(raw)
 
     def _encode_state(
@@ -129,29 +122,29 @@ class BERT4RecPipeline:
         Returns:
             state       — encoded state tensor (1, state_dim)
             alpha_t     — relevance-diversity trade-off ∈ [0, 1]
-            eta_t       — exploration intensity ∈ [0, 1]
+            kappa_t     — exploration intensity ∈ [0, 1]
             raw_action  — pre-squash latent action (for replay buffer)
         """
-        state       = self._encode_state(history_ids, history_extras)
+        state         = self._encode_state(history_ids, history_extras)
         policy_action = self.rl_policy.act(state, deterministic=deterministic)
-        alpha_t     = (
+        alpha_t       = (
             self.fixed_alpha
             if self.fixed_alpha is not None
             else float(policy_action["alpha"].item())
         )
-        eta_t       = float(policy_action["kappa"].item())
-        raw_action  = policy_action["raw"].detach().cpu().numpy()[0]
-        return state, alpha_t, eta_t, raw_action
+        kappa_t       = float(policy_action["kappa"].item())
+        raw_action    = policy_action["raw"].detach().cpu().numpy()[0]
+        return state, alpha_t, kappa_t, raw_action
 
     def _build_slate(
         self,
         candidates: List[ScoredCandidate],
         alpha_t: float,
-        eta_t: float,
+        kappa_t: float,
         budget: float,
     ) -> Tuple[List[int], float]:
         """
-        Stage 3: run the submodular greedy selector.
+        Stage 2: run the submodular greedy selector.
 
         Returns:
             selected_indices — item_idx list (length ≤ slate_size)
@@ -170,7 +163,7 @@ class BERT4RecPipeline:
             budget=budget,
             costs=costs,
             alpha_override=alpha_t,
-            kappa=eta_t,
+            kappa=kappa_t,
         )
         return selected_indices, slate_score
 
@@ -207,12 +200,12 @@ class BERT4RecPipeline:
         if not candidates:
             return [], None
 
-        state, alpha_t, eta_t, _ = self._run_policy(
+        state, alpha_t, kappa_t, _ = self._run_policy(
             history_ids, history_extras, deterministic=deterministic
         )
 
         selected_indices, slate_score = self._build_slate(
-            candidates, alpha_t, eta_t, budget
+            candidates, alpha_t, kappa_t, budget
         )
 
         relevance_scores  = {c.item_idx: c.rel_score for c in candidates}
@@ -241,13 +234,13 @@ class BERT4RecPipeline:
         retrieval_batch_size: int = 512,
     ) -> list:
         """
-        Batched evaluation: groups FAISS queries for throughput (~2× faster
+        Batched evaluation: groups queries for throughput (~2× faster
         than sequential search()).
 
         Args:
             steps                — list of TrajectoryStep-like objects with
                                    .history_ids, .history_extras, .seen_ids, .budget
-            retrieval_batch_size — BERT4Rec batch size for ANN search
+            retrieval_batch_size — batch size for retriever ANN search
 
         Returns:
             List[List[int]] — one item_idx slate per step.
@@ -256,13 +249,13 @@ class BERT4RecPipeline:
         for start in range(0, len(steps), retrieval_batch_size):
             batch = steps[start: start + retrieval_batch_size]
 
-            # Stage 1: batch BERT4Rec retrieval
+            # Stage 1: batch retrieval
             histories = [s.history_ids for s in batch]
             batch_retrieval_results = self.retriever.batch_search_by_history(
-                histories, top_k=self.top_m
+                histories, top_k=self.n_retrieve
             )
 
-            # Stage 2–3: per-user state encoding, policy, greedy selection
+            # Stage 2: per-user state encoding, policy, greedy selection
             for step, retrieval_results in zip(batch, batch_retrieval_results):
                 seen_items = set(step.seen_ids) if getattr(step, "seen_ids", None) else set()
 
@@ -275,7 +268,7 @@ class BERT4RecPipeline:
                     all_slates.append([])
                     continue
 
-                _, alpha_t, eta_t, _ = self._run_policy(
+                _, alpha_t, kappa_t, _ = self._run_policy(
                     step.history_ids,
                     getattr(step, "history_extras", None),
                     deterministic=True,
@@ -283,7 +276,7 @@ class BERT4RecPipeline:
                 budget = getattr(step, "budget", None) or float(self.slate_size)
 
                 selected_indices, _ = self._build_slate(
-                    candidates, alpha_t, eta_t, budget
+                    candidates, alpha_t, kappa_t, budget
                 )
                 all_slates.append(selected_indices)
 
@@ -325,11 +318,11 @@ class BERT4RecPipeline:
                     text="",
                 ))
 
-        state, alpha_t, eta_t, raw_action = self._run_policy(
+        state, alpha_t, kappa_t, raw_action = self._run_policy(
             history_ids, history_extras, deterministic=False
         )
 
-        selected_indices, _ = self._build_slate(candidates, alpha_t, eta_t, budget)
+        selected_indices, _ = self._build_slate(candidates, alpha_t, kappa_t, budget)
 
         relevance_scores = {c.item_idx: c.rel_score for c in candidates}
 
@@ -344,6 +337,6 @@ class BERT4RecPipeline:
             "target":             target_item_idx,
             "reward":             reward,
             "alpha":              alpha_t,
-            "eta":                eta_t,
+            "kappa":              kappa_t,
             "budget":             budget,
         }

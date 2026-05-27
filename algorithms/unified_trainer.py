@@ -122,6 +122,7 @@ class UnifiedJointTrainer:
         buffer_size: int = 20_000,
         min_buffer: int = 128,
         gamma: float = 0.99,
+        bc_coeff: float = 0.01,
         device: torch.device = torch.device("cpu"),
     ):
         self.pipeline = pipeline
@@ -133,6 +134,7 @@ class UnifiedJointTrainer:
         self.batch_size = batch_size
         self.min_buffer = min_buffer
         self.gamma = gamma
+        self.bc_coeff = bc_coeff
         self.device = device
 
         self.replay = UnifiedReplayBuffer(max_size=buffer_size)
@@ -179,7 +181,8 @@ class UnifiedJointTrainer:
         next_states = torch.FloatTensor(np.stack([t.next_state for t in batch])).to(self.device)
         dones = torch.BoolTensor([t.done for t in batch]).to(self.device)
 
-        return self.rl.update(states, actions, rewards, next_states, dones)
+        return self.rl.update(states, actions, rewards, next_states, dones,
+                              bc_coeff=self.bc_coeff)
 
     # ------------------------------------------------------------------
     # Submodular update  (L_sub = L_reinforce + λ_rank * L_div_rank)
@@ -234,8 +237,8 @@ class UnifiedJointTrainer:
             alpha=alphas_sig,
         )   # (B,) differentiable through diversity embeddings
 
-        # log(f_θ) — add small eps for numerical stability
-        log_scores = torch.log(soft_scores.clamp(min=1e-6))
+        # Eq 2 F^sub can be negative; log(σ(F^sub)) is always well-defined
+        log_scores = F.logsigmoid(soft_scores)
         l_reinforce = -(reward_t * log_scores).mean()
 
         # ---- L_div_rank ----

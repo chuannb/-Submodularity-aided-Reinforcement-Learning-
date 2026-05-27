@@ -24,6 +24,7 @@ class TrajectoryStep:
     history_extras: Optional[List[float]] = None  # stars or event weights
     event: Optional[str] = None                   # RetailRocket event type
     reward: Optional[float] = None                # explicit reward
+    seen_ids: Optional[List[int]] = None          # items to exclude from candidates (train+val)
 
 
 # ---------------------------------------------------------------------------

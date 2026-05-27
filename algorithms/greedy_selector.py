@@ -150,8 +150,6 @@ def budgeted_submodular_greedy_reranker(
     slate_local: List[int] = []   # local indices into candidates[]
     in_slate = np.zeros(n, dtype=bool)
     budget_rem = float(budget)
-    kernel_sum = 0.0   # Σ_{i≠j ∈ slate} k(e_i, e_j) (ordered pairs)
-    sum_rel    = 0.0   # Σ_{i ∈ slate} rel(i)
     k_cur      = 0     # current slate size
 
     eps = eps_from_kappa(kappa)
@@ -162,22 +160,13 @@ def budgeted_submodular_greedy_reranker(
         if feasible.size == 0:
             break
 
-        # ── Vectorized marginal gain for all feasible items ──────────────
+        # ── Eq 2 marginal gain: Δ^sub(x|S) = α·r(x) - (1-α)·Σ_{j∈S}κ(j,x) ──
         if k_cur == 0:
-            # Single-item slate: diversity = 0, only relevance counts
             benefit = alpha * rel_arr[feasible]
         else:
-            # f(S) — same for all candidates, compute once
-            div_S = (1.0 - kernel_sum / (k_cur * (k_cur - 1))) if k_cur >= 2 else 0.0
-            f_S   = alpha * (sum_rel / k_cur) + (1.0 - alpha) * div_S
-
-            # For each feasible item i: Σ_{j∈slate} k(e_i, e_j)  → shape (|feasible|,)
+            # Σ_{j∈slate} κ(j, x) for each feasible x  → shape (|feasible|,)
             sum_k = k_np[np.ix_(feasible, slate_local)].sum(axis=1)
-
-            new_k   = k_cur + 1
-            rel_new = (sum_rel + rel_arr[feasible]) / new_k
-            div_new = 1.0 - (kernel_sum + 2.0 * sum_k) / (new_k * k_cur)
-            benefit = alpha * rel_new + (1.0 - alpha) * div_new - f_S
+            benefit = alpha * rel_arr[feasible] - (1.0 - alpha) * sum_k
 
         ratios = benefit / np.maximum(cost_arr[feasible], 1e-8)
 
@@ -192,10 +181,6 @@ def budgeted_submodular_greedy_reranker(
 
         chosen = int(feasible[local_idx])
 
-        # Update incremental state
-        if k_cur > 0:
-            kernel_sum += 2.0 * k_np[chosen, slate_local].sum()
-        sum_rel += rel_arr[chosen]
         slate_local.append(chosen)
         in_slate[chosen] = True
         budget_rem -= cost_arr[chosen]

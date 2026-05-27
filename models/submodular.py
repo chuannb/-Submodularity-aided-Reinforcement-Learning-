@@ -285,14 +285,15 @@ class RerankerBackedSubmodular(nn.Module):
         alpha_override: float = None,
     ) -> float:
         """
-        Evaluate f_θ(S) given external reranker relevance scores.
+        Evaluate F^sub(S) = α·Σr(i) - (1-α)·Σ_{i<j}κ(i,j)  [Eq 2].
         Used inside greedy to score full slates.
         """
         if not slate_ids:
             return 0.0
 
-        rel = float(sum(reranker_scores) / len(reranker_scores))
+        rel = float(sum(reranker_scores))
 
+        pair_k = 0.0
         if len(slate_ids) >= 2:
             device = self.item_emb.weight.device
             with torch.no_grad():
@@ -304,13 +305,10 @@ class RerankerBackedSubmodular(nn.Module):
                     k_mat = torch.exp(-(1.0 - sim) / bw)
                 else:
                     k_mat = (sim + 1.0) / 2.0
-                mask = ~torch.eye(len(slate_ids), dtype=torch.bool, device=device)
-                div = (1.0 - k_mat)[mask].mean().item()
-        else:
-            div = 0.0
+                pair_k = k_mat.triu(diagonal=1).sum().item()
 
         alpha = alpha_override if alpha_override is not None else self.alpha.item()
-        return alpha * rel + (1.0 - alpha) * div
+        return alpha * rel - (1.0 - alpha) * pair_k
 
     # ------------------------------------------------------------------
     def marginal_gain_with_scores(
@@ -339,36 +337,35 @@ class RerankerBackedSubmodular(nn.Module):
         item_ids: torch.Tensor,          # (B, K) — slate items
         reranker_scores: torch.Tensor,   # (B, K) — precomputed rel scores
         alpha: torch.Tensor,             # (B,) or scalar
-    ) -> torch.Tensor:                   # (B,) — differentiable f_θ value
+    ) -> torch.Tensor:                   # (B,) — differentiable F^sub value
         """
-        Differentiable version used for computing gradients through θ.
+        Differentiable F^sub(S) = α·Σr(i) - (1-α)·Σ_{i<j}κ(i,j)  [Eq 2].
 
-        relevance = mean of reranker_scores (no gradient through reranker)
-        diversity = mean pairwise distance in diversity embedding space (has gradient)
+        relevance = sum of reranker_scores (no gradient through reranker)
+        pair_k    = sum of upper-triangle kernel values (has gradient through θ)
         """
         B, K = item_ids.shape
         embs = self.item_emb(item_ids)          # (B, K, d)
         embs_norm = F.normalize(embs, dim=-1)   # (B, K, d)
 
-        # Pairwise similarities
+        # Pairwise kernel values — detach bandwidth so L_reinforce cannot
+        # drive bw→0 (bandwidth collapse). bw is updated only by L_div_rank.
         sim = torch.bmm(embs_norm, embs_norm.transpose(1, 2))  # (B, K, K)
         if self.kernel == "rbf":
-            bw = torch.exp(self.log_bandwidth).clamp(min=1e-3)
+            bw = torch.exp(self.log_bandwidth.detach()).clamp(min=1e-3)
             k_mat = torch.exp(-(1.0 - sim) / bw)
         else:
             k_mat = (sim + 1.0) / 2.0
 
-        # Mask diagonal
-        eye = torch.eye(K, dtype=torch.bool, device=item_ids.device)
-        k_mat = k_mat.masked_fill(eye.unsqueeze(0), 0.0)
-        div = (1.0 - k_mat).sum(dim=(1, 2)) / (K * (K - 1) + 1e-8)   # (B,)
+        # Sum over unordered pairs (upper triangle, diagonal excluded)
+        pair_k = k_mat.triu(diagonal=1).sum(dim=(1, 2))   # (B,)
 
-        rel = reranker_scores.mean(dim=-1).detach()   # (B,) — reranker detached
+        rel = reranker_scores.sum(dim=-1).detach()          # (B,) — reranker detached
 
         if isinstance(alpha, float):
-            return alpha * rel + (1.0 - alpha) * div
+            return alpha * rel - (1.0 - alpha) * pair_k
         alpha_b = alpha.view(B)
-        return alpha_b * rel + (1.0 - alpha_b) * div
+        return alpha_b * rel - (1.0 - alpha_b) * pair_k
 
     # ------------------------------------------------------------------
     def diversity_ranking_loss(

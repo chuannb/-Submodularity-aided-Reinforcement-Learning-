@@ -151,10 +151,10 @@ class ICSRecRetriever:
     # ------------------------------------------------------------------
     @torch.no_grad()
     def _build_faiss_index(self):
-        """Build normalized FAISS flat inner-product index from item embeddings."""
+        """Build raw-dot-product FAISS flat inner-product index from item embeddings."""
         # item_embeddings: (item_size, d), indices 1..item_num are real items
         embs = self.model.item_embeddings.weight[1: self.item_num + 1]  # (item_num, d)
-        embs = F.normalize(embs, dim=-1)
+        # No L2 normalization — raw inner product matches ICSRec training objective
         embs_np = embs.cpu().float().numpy()
 
         self.index = faiss.IndexFlatIP(embs_np.shape[1])
@@ -164,20 +164,19 @@ class ICSRecRetriever:
     # ------------------------------------------------------------------
     @torch.no_grad()
     def _encode_history(self, history_ids: List[int]) -> np.ndarray:
-        """Encode single user history → (1, d) normalized float32 array."""
+        """Encode single user history → (1, d) raw float32 array."""
         seq = np.zeros(self.maxlen, dtype=np.int64)
         hist = [h for h in history_ids if 1 <= h <= self.item_num]
         h = hist[-self.maxlen:]
         seq[-len(h):] = h
         seq_t = torch.from_numpy(seq).unsqueeze(0).to(self.device)
         out = self.model(seq_t)               # (1, L, d)
-        uemb = out[0, -1, :]                  # last position
-        uemb = F.normalize(uemb, dim=-1)
+        uemb = out[0, -1, :]                  # last position, no L2 norm
         return uemb.cpu().float().numpy()[None]  # (1, d)
 
     @torch.no_grad()
     def _encode_batch(self, batch_history: List[List[int]]) -> np.ndarray:
-        """Batch encode → (B, d) normalized float32 array."""
+        """Batch encode → (B, d) raw float32 array."""
         B = len(batch_history)
         seqs = np.zeros((B, self.maxlen), dtype=np.int64)
         for i, hist in enumerate(batch_history):
@@ -185,8 +184,7 @@ class ICSRecRetriever:
             seqs[i, -len(h):] = h
         seqs_t = torch.from_numpy(seqs).to(self.device)
         out = self.model(seqs_t)              # (B, L, d)
-        uembs = out[:, -1, :]                 # (B, d)
-        uembs = F.normalize(uembs, dim=-1)
+        uembs = out[:, -1, :]                 # (B, d), no L2 norm
         return uembs.cpu().float().numpy()
 
     # ------------------------------------------------------------------

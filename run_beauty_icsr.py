@@ -1,6 +1,6 @@
 """
 End-to-end pipeline: ICSRec-SAS → Submodular+RL
-Cho Amazon 2014 5-core datasets (Beauty / Sports / Toys)
+Cho Amazon Beauty 2014 5-core dataset
 
 Thay BERT4Rec retriever bằng ICSRec-SAS (WSDM 2024 Oral):
   - Full-softmax CE loss → item embeddings tốt hơn
@@ -16,14 +16,10 @@ Steps:
 
 Usage:
   # Smoke test
-  python run_beauty_icsr.py --dataset beauty --max_users 200 \\
-      --epochs 1 --steps_per_epoch 50 --device cuda
+  python run_beauty_icsr.py --max_users 200 --epochs 1 --steps_per_epoch 50 --device cuda
 
   # Full run
-  python run_beauty_icsr.py --dataset beauty --epochs 10 --device cuda
-
-  # Skip retriever init check (assumes model trained)
-  python run_beauty_icsr.py --dataset beauty --epochs 10 --device cuda --n_retrieve 200
+  python run_beauty_icsr.py --epochs 10 --device cuda
 """
 
 from __future__ import annotations
@@ -42,25 +38,11 @@ import torch
 RECSYS_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(RECSYS_DIR))
 
-ICSREC_DATA = Path("/workspace/repos/ICSRec/data")
-
-DATASET_PATHS = {
-    "beauty": "/workspace/datasets/beauty_2014/reviews_5core.json.gz",
-    "sports": "/workspace/datasets/sports_2014/reviews_5core.json.gz",
-    "toys":   "/workspace/datasets/toys_2014/reviews_5core.json.gz",
-}
-
-DATASET_TXT = {
-    "beauty": "Beauty",
-    "sports": "Sports_and_Outdoors",
-    "toys":   "Toys_and_Games",
-}
-
-DATASET_SIZES = {
-    "beauty": (22_363, 12_101),
-    "sports": (35_598, 18_357),
-    "toys":   (19_412, 11_924),
-}
+ICSREC_DATA   = Path("/workspace/repos/ICSRec/data")
+DATASET       = "beauty"
+REVIEW_PATH   = "/workspace/datasets/beauty_2014/reviews_5core.json.gz"
+DATASET_TXT   = "Beauty"
+EXPECTED_USERS, EXPECTED_ITEMS = 22_363, 12_101
 
 
 def set_seed(seed: int) -> None:
@@ -73,10 +55,9 @@ def set_seed(seed: int) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="ICSRec-SAS → Submodular+RL pipeline on Amazon 2014 5-core"
+        description="ICSRec-SAS → Submodular+RL pipeline on Amazon Beauty 2014 5-core"
     )
-    p.add_argument("--dataset", default="beauty", choices=list(DATASET_PATHS))
-    p.add_argument("--output_dir", default=None, help="Default: output_<dataset>_icsr")
+    p.add_argument("--output_dir", default=None, help="Default: output_beauty_icsr")
     p.add_argument("--max_users",  type=int, default=None)
 
     # ICSRec checkpoint (optional override)
@@ -96,6 +77,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--buffer_size",     type=int,   default=10_000)
     p.add_argument("--min_buffer",      type=int,   default=64)
     p.add_argument("--log_every",       type=int,   default=50)
+    p.add_argument("--test_every",      type=int,   default=10,
+                   help="Run TEST evaluation every N epochs (val runs every epoch)")
 
     # Optimiser
     p.add_argument("--lr_rl",       type=float, default=3e-4)
@@ -105,6 +88,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda_sub",  type=float, default=0.5)
     p.add_argument("--lambda_rank", type=float, default=0.1)
     p.add_argument("--alpha_init",  type=float, default=0.7)
+    p.add_argument("--bc_coeff",    type=float, default=0.01,
+                   help="BC coefficient for kappa only (alpha is free from BC)")
+    p.add_argument("--ent_coeff",   type=float, default=0.05,
+                   help="Entropy bonus coefficient to prevent alpha collapse")
+    p.add_argument("--fixed_alpha", type=float, default=None,
+                   help="Bypass RL alpha entirely — use this fixed value (0-1) for all decisions")
+    p.add_argument("--actor_alpha_bias", type=float, default=None,
+                   help="Initialize actor mean_head bias[0] to logit(this value) to center alpha here")
 
     # Misc
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -127,8 +118,7 @@ def load_icsrec_data(dataset: str, max_users: Optional[int] = None):
         user_seqs  : {user_idx_str: [item_int_ids]}  (train+val+test items, sorted by time)
         item_num   : max item int id
     """
-    txt_name = DATASET_TXT[dataset]
-    txt_path = ICSREC_DATA / f"{txt_name}.txt"
+    txt_path = ICSREC_DATA / f"{DATASET_TXT}.txt"
     asin2id_path = ICSREC_DATA / f"{dataset}_asin2id.json"
     id2asin_path = ICSREC_DATA / f"{dataset}_id2asin.json"
 
@@ -198,6 +188,7 @@ def build_trajectories_icsr(
                 budget=float(slate_size),
                 split="test",
                 reward=reward,
+                seen_ids=list(seq[:-1]),   # exclude train+val items (ICSRec protocol)
             ))
 
         elif split == "val":
@@ -213,6 +204,7 @@ def build_trajectories_icsr(
                 budget=float(slate_size),
                 split="val",
                 reward=reward,
+                seen_ids=list(seq[:-2]),   # exclude train items only
             ))
 
         else:  # train — sliding window
@@ -244,14 +236,13 @@ def main() -> None:
     set_seed(args.seed)
     device = torch.device(args.device)
 
-    output_dir = Path(args.output_dir or f"output_{args.dataset}_icsr")
+    output_dir = Path(args.output_dir or "output_beauty_icsr")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    expected_users, expected_items = DATASET_SIZES[args.dataset]
     print(f"\n{'='*60}")
-    print(f"Dataset: {args.dataset.upper()} 2014 5-core  [ICSRec retriever]")
-    print(f"  Expected: {expected_users:,} users, {expected_items:,} items")
-    print(f"  ICSRec data: {ICSREC_DATA / DATASET_TXT[args.dataset]}.txt")
+    print(f"Dataset: BEAUTY 2014 5-core  [ICSRec retriever]")
+    print(f"  Expected: {EXPECTED_USERS:,} users, {EXPECTED_ITEMS:,} items")
+    print(f"  ICSRec data: {ICSREC_DATA / DATASET_TXT}.txt")
     print(f"  Output:  {output_dir}")
     print(f"  Device:  {device}")
     if args.max_users:
@@ -261,8 +252,8 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Step 1: Load ICSRec-format data
     # ------------------------------------------------------------------
-    print(f"\nStep 1: Loading {args.dataset} ICSRec data...")
-    asin2iid, id2asin, user_seqs, item_num = load_icsrec_data(args.dataset, args.max_users)
+    print(f"\nStep 1: Loading beauty ICSRec data...")
+    asin2iid, id2asin, user_seqs, item_num = load_icsrec_data(DATASET, args.max_users)
     # Always use full catalog size (retriever returns items up to this ID regardless of max_users)
     full_item_num = len(asin2iid)
     print(f"  Users: {len(user_seqs):,}  Items in seqs: {item_num:,}  Catalog: {full_item_num:,}")
@@ -278,7 +269,7 @@ def main() -> None:
     from retrieval.icsr_retriever import ICSRecRetriever
 
     retriever = ICSRecRetriever(
-        dataset=args.dataset,
+        dataset=DATASET,
         device=device,
         id_map_inv=id2asin,
         ckpt_path=args.ckpt_path,
@@ -288,7 +279,7 @@ def main() -> None:
     # Step 3: Build pipeline
     # ------------------------------------------------------------------
     print(f"\nStep 3: Building pipeline components...")
-    from retrieval.bert4rec_pipeline import BERT4RecPipeline
+    from retrieval.two_stage_pipeline import TwoStageRLPipeline
     from retrieval.unified_pipeline import UnifiedRLPolicy
     from models.submodular import RerankerBackedSubmodular
     from utils.encoders import StateEncoder
@@ -300,19 +291,30 @@ def main() -> None:
     state_encoder = StateEncoder(num_items=item_num, embed_dim=embed_dim).to(device)
     rl_policy     = UnifiedRLPolicy(
         state_dim=embed_dim, hidden_dim=256, lr=args.lr_rl, gamma=args.gamma,
+        ent_coeff=args.ent_coeff,
     ).to(device)
 
-    pipeline = BERT4RecPipeline(
+    if args.actor_alpha_bias is not None:
+        import math
+        bias_val = math.log(args.actor_alpha_bias / (1.0 - args.actor_alpha_bias))
+        with torch.no_grad():
+            rl_policy.actor.mean_head.bias[0].fill_(bias_val)
+        print(f"  actor mean_head bias[0] set to {bias_val:.3f} → sigmoid={args.actor_alpha_bias}")
+
+    pipeline = TwoStageRLPipeline(
         retriever=retriever,
         submodular=submodular,
         rl_policy=rl_policy,
         state_encoder=state_encoder,
-        id_map=id_map,
+        item_id_map=id_map,
         device=device,
         n_retrieve=args.n_retrieve,
         slate_size=args.slate_size,
         history_length=args.history_length,
     )
+    if args.fixed_alpha is not None:
+        pipeline.fixed_alpha = args.fixed_alpha
+        print(f"  fixed_alpha={args.fixed_alpha} — RL alpha bypassed")
 
     total_params = sum(p.numel() for p in (
         list(submodular.parameters()) +
@@ -331,9 +333,8 @@ def main() -> None:
     import gzip
     from collections import defaultdict
     target_ratings: Dict[str, Dict[int, float]] = defaultdict(dict)
-    review_path = DATASET_PATHS[args.dataset]
-    opener = gzip.open if review_path.endswith(".gz") else open
-    with opener(review_path, "rt", encoding="utf-8") as f:
+    opener = gzip.open if REVIEW_PATH.endswith(".gz") else open
+    with opener(REVIEW_PATH, "rt", encoding="utf-8") as f:
         for line in f:
             try:
                 r = json.loads(line.strip())
@@ -381,11 +382,27 @@ def main() -> None:
         buffer_size=args.buffer_size,
         min_buffer=args.min_buffer,
         gamma=args.gamma,
+        bc_coeff=args.bc_coeff,
         device=device,
     )
 
     best_hit  = 0.0
     ckpt_path = output_dir / "best_unified.pt"
+
+    # Epoch-0 baseline eval (runs before any training, useful for --epochs 0)
+    print(f"\n[Epoch 0 — pre-training baseline]")
+    _eval0 = val_steps[:args.eval_steps] if args.eval_steps else val_steps
+    _val0  = trainer.evaluate(_eval0, make_query, dataset_type="amazon")
+    print(f"  Val  hit@{args.slate_size}={_val0['hit@k']:.4f}  "
+          f"ndcg@{args.slate_size}={_val0['ndcg@k']:.4f}  "
+          f"mrr@{args.slate_size}={_val0.get('mrr@k', 0.0):.4f}  "
+          f"coverage={_val0['coverage']:.4f}")
+    _test0 = test_steps[:args.eval_steps] if args.eval_steps else test_steps
+    _t0    = trainer.evaluate(_test0, make_query, dataset_type="amazon")
+    print(f"  Test hit@{args.slate_size}={_t0['hit@k']:.4f}  "
+          f"ndcg@{args.slate_size}={_t0['ndcg@k']:.4f}  "
+          f"mrr@{args.slate_size}={_t0.get('mrr@k', 0.0):.4f}  "
+          f"ild={_t0.get('ild', 0.0):.4f}  [epoch 0 baseline]")
 
     for epoch in range(1, args.epochs + 1):
         print(f"\n[Epoch {epoch}/{args.epochs}]")
@@ -398,20 +415,20 @@ def main() -> None:
             fast_mode=False,
         )
 
+        loss_str = "  ".join(f"{k}={v:.4f}" for k, v in losses.items()) or "(warmup)"
+        print(f"  Losses: {loss_str}")
+
+        # Val evaluation — every epoch (for best checkpoint tracking)
         eval_steps  = val_steps[:args.eval_steps] if args.eval_steps else val_steps
         val_metrics = trainer.evaluate(
             eval_steps=eval_steps,
             pipeline_query_fn=make_query,
             dataset_type="amazon",
         )
-
-        loss_str = "  ".join(f"{k}={v:.4f}" for k, v in losses.items()) or "(warmup)"
-        print(f"  Losses: {loss_str}")
-        print(f"  Val hit@{args.slate_size}={val_metrics['hit@k']:.4f}  "
+        print(f"  Val  hit@{args.slate_size}={val_metrics['hit@k']:.4f}  "
               f"ndcg@{args.slate_size}={val_metrics['ndcg@k']:.4f}  "
               f"mrr@{args.slate_size}={val_metrics.get('mrr@k', 0.0):.4f}  "
-              f"coverage={val_metrics['coverage']:.4f}  "
-              f"n={val_metrics['n_samples']}")
+              f"coverage={val_metrics['coverage']:.4f}")
 
         if val_metrics["hit@k"] > best_hit:
             best_hit = val_metrics["hit@k"]
@@ -424,6 +441,25 @@ def main() -> None:
                 "best_hit":       best_hit,
             }, ckpt_path)
             print(f"  *** New best hit@{args.slate_size}={best_hit:.4f} saved ***")
+
+        # Test evaluation — every test_every epochs
+        if epoch % args.test_every == 0 or epoch == args.epochs:
+            eval_test_mid   = test_steps[:args.eval_steps] if args.eval_steps else test_steps
+            test_mid = trainer.evaluate(
+                eval_steps=eval_test_mid,
+                pipeline_query_fn=make_query,
+                dataset_type="amazon",
+            )
+            all_slates_mid  = trainer.metrics.all_slates
+            icsrec_embs_mid = retriever.model.item_embeddings.weight.detach().cpu()
+            from utils.metrics import diversity_score
+            ild_mid = float(np.mean([
+                diversity_score(s, icsrec_embs_mid) for s in all_slates_mid if len(s) >= 2
+            ])) if any(len(s) >= 2 for s in all_slates_mid) else 0.0
+            print(f"  Test hit@{args.slate_size}={test_mid['hit@k']:.4f}  "
+                  f"ndcg@{args.slate_size}={test_mid['ndcg@k']:.4f}  "
+                  f"mrr@{args.slate_size}={test_mid.get('mrr@k', 0.0):.4f}  "
+                  f"ild={ild_mid:.4f}  [epoch {epoch}]")
 
     # ------------------------------------------------------------------
     # Step 6: Final evaluation on TEST set
@@ -444,15 +480,17 @@ def main() -> None:
         dataset_type="amazon",
     )
 
-    # ILD
+    # ILD — use ICSRec frozen embeddings (semantic) so the metric reflects
+    # actual content diversity, not the trained diversity-module embeddings
+    # which are optimised to minimise pairwise κ and can diverge.
     all_slates  = trainer.metrics.all_slates
-    emb_weight  = submodular.item_emb.weight.detach().cpu()
+    icsrec_embs = retriever.model.item_embeddings.weight.detach().cpu()  # (N+2, 64)
     from utils.metrics import diversity_score
-    ild_scores = [diversity_score(s, emb_weight) for s in all_slates if len(s) >= 2]
+    ild_scores = [diversity_score(s, icsrec_embs) for s in all_slates if len(s) >= 2]
     ild = float(np.mean(ild_scores)) if ild_scores else 0.0
 
     print(f"\n{'='*60}")
-    print(f"FINAL TEST RESULTS  [{args.dataset.upper()} 2014 5-core]  ICSRec retriever  (k={args.slate_size})")
+    print(f"FINAL TEST RESULTS  [BEAUTY 2014 5-core]  ICSRec retriever  (k={args.slate_size})")
     print(f"{'='*60}")
     print(f"  Hit@{args.slate_size}      = {test_metrics['hit@k']:.4f}")
     print(f"  NDCG@{args.slate_size}     = {test_metrics['ndcg@k']:.4f}")
@@ -462,20 +500,22 @@ def main() -> None:
     print(f"  N samples  = {test_metrics['n_samples']}")
     print(f"{'='*60}")
 
+    # Same-pipeline baseline (ICSRec FAISS-200 top-10, raw dot, excl seen, epochs=0)
+    # Full-cat baselines are from ICSRec paper Table 2 (different protocol: full-catalogue)
     baselines = {
-        "beauty": {"ICSRec (paper HR@10)": 0.0963, "SASRec": 0.0624, "BERT4Rec": 0.0601},
-        "sports": {"ICSRec (paper HR@10)": 0.0594, "SASRec": 0.0333, "BERT4Rec": 0.0359},
-        "toys":   {"ICSRec (paper HR@10)": 0.0919, "SASRec": 0.0652, "BERT4Rec": 0.0524},
+        "ICSRec FAISS-200 top-10 [same pipeline]": 0.0883,
+        "ICSRec full-cat [paper, diff protocol]":  0.0963,
+        "SASRec  full-cat [ICSRec paper]":         0.0624,
+        "BERT4Rec full-cat [ICSRec paper]":        0.0601,
     }
-    if args.dataset in baselines:
-        print(f"\n  Comparison (Hit@10):")
-        for name, val in baselines[args.dataset].items():
-            diff = test_metrics["hit@k"] - val
-            sign = "+" if diff >= 0 else ""
-            print(f"    {name:30s}: {val:.4f}  (ours: {sign}{diff:.4f})")
+    print(f"\n  Comparison (Hit@10):")
+    for name, val in baselines.items():
+        diff = test_metrics["hit@k"] - val
+        sign = "+" if diff >= 0 else ""
+        print(f"    {name:35s}: {val:.4f}  (ours: {sign}{diff:.4f})")
 
     results = {
-        "dataset":     args.dataset,
+        "dataset":     DATASET,
         "item_num":    item_num,
         "n_users":     len(user_seqs),
         "retriever":   "ICSRec-SAS",

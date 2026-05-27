@@ -6,11 +6,11 @@ Three-stage recommendation pipeline:
 |-------|-----------|------|
 | 1 | **ICSRec-SAS** (frozen) | Sequential dense retriever; returns top-m candidates via FAISS |
 | 2 | *(dense retriever — no separate reranker)* | ICSRec similarity scores used directly as r_u(i) |
-| 3 | **Submodular RL** (trained) | Actor-critic policy learns per-user (α_t, η_t); submodular greedy builds slate of k items |
+| 3 | **Submodular RL** (trained) | Actor-critic policy learns per-user (α_t, κ_t); submodular greedy builds slate of k items |
 
 The RL action is 2-dimensional:
 - **α_t** — relevance-diversity trade-off weight in the submodular objective F_θ(S | α_t)
-- **η_t** — training-time exploration intensity (ε-greedy + softmax temperature)
+- **κ_t** — training-time exploration intensity (ε-greedy + softmax temperature)
 
 ## Requirements
 
@@ -22,12 +22,9 @@ pip install -r requirements.txt
 
 ## How to Run
 
-### Beauty (main experiment)
-
 ```bash
 # Smoke test (CPU, ~2 min)
 python run_beauty_icsr.py \
-    --dataset beauty \
     --max_users 200 \
     --epochs 1 \
     --steps_per_epoch 50 \
@@ -35,7 +32,6 @@ python run_beauty_icsr.py \
 
 # Full run (GPU, 100 epochs)
 python run_beauty_icsr.py \
-    --dataset beauty \
     --epochs 100 \
     --steps_per_epoch 500 \
     --device cuda \
@@ -43,48 +39,43 @@ python run_beauty_icsr.py \
 
 # Resume with a specific ICSRec checkpoint
 python run_beauty_icsr.py \
-    --dataset beauty \
     --epochs 100 \
     --ckpt_path /workspace/repos/ICSRec/src/output/ICSRec-SAS-Beauty-ep80.pt \
     --output_dir output_beauty_ep80 \
     --device cuda
-```
 
-### Sports / Toys
-
-```bash
-python run_beauty_icsr.py --dataset sports --epochs 100 --device cuda
-python run_beauty_icsr.py --dataset toys   --epochs 100 --device cuda
+# Evaluate best checkpoint only (no training)
+python run_beauty_icsr.py --epochs 0 --output_dir <checkpoint_dir> --device cuda
 ```
 
 ### Key arguments
 
 | Arg | Default | Description |
 |-----|---------|-------------|
-| `--dataset` | `beauty` | `beauty` / `sports` / `toys` |
 | `--ckpt_path` | ICSRec default | Override ICSRec checkpoint path |
-| `--output_dir` | `output_{dataset}_icsr` | Directory for checkpoints + results |
-| `--epochs` | `10` | Training epochs |
+| `--output_dir` | `output_beauty_icsr` | Directory for checkpoints + results |
+| `--epochs` | `10` | Training epochs (0 = eval only) |
 | `--steps_per_epoch` | `500` | Sampled training steps per epoch |
 | `--n_retrieve` | `200` | Candidate pool size m (FAISS top-m) |
 | `--slate_size` | `10` | Final slate size k |
 | `--history_length` | `20` | User history window h |
+| `--actor_alpha_bias` | `None` | Init actor α-head bias to logit(value) |
+| `--fixed_alpha` | `None` | Bypass RL α entirely, use fixed value |
 | `--device` | `cuda` | `cpu` or `cuda` |
 
 ## Folder Structure
 
 ```
 LM_Submodular_RL/
-├── run_beauty_icsr.py              # Main entry point (ICSRec pipeline)
+├── run_beauty_icsr.py              # Main entry point
 │
 ├── retrieval/
 │   ├── icsr_retriever.py           # ICSRec-SAS + FAISS retriever (Stage 1)
+│   ├── two_stage_pipeline.py       # Generic two-stage pipeline (any retriever)
 │   ├── unified_pipeline.py         # RL policy (UnifiedRLPolicy) + typed containers
 │   │                               #   ScoredCandidate, UnifiedSearchResult
-│   ├── bert4rec_pipeline.py        # Alternative pipeline: BERT4Rec retriever
-│   │                               #   (same search/collect_transition interface)
-│   ├── bert4rec_retriever.py       # BERT4Rec ANN retriever
-│   └── bm25_retriever.py           # BM25 retriever (legacy, unused)
+│   ├── bert4rec_retriever.py       # BERT4Rec ANN retriever (alternative Stage 1)
+│   └── bm25_retriever.py           # BM25 retriever (alternative Stage 1)
 │
 ├── models/
 │   ├── submodular.py               # RerankerBackedSubmodular
@@ -100,9 +91,11 @@ LM_Submodular_RL/
 │   ├── encoders.py                 # StateEncoder (GRU + mean-pool), pad_history
 │   └── metrics.py                  # HR@k, NDCG@k, MRR@k, ILD, Coverage
 │
-├── data/                           # Dataset loaders (Amazon 5-core, RetailRocket)
-├── retrieval_models/               # BERT4Rec training scripts
-└── tests/
+├── tests/
+│   ├── test_two_stage_pipeline.py  # Smoke tests for TwoStageRLPipeline
+│   └── test_amazon_weights.py
+│
+└── stuff/                          # Experiment outputs (gitignored)
 ```
 
 ## Data Dependencies
@@ -118,21 +111,30 @@ LM_Submodular_RL/
 
 ## Output
 
-Each run writes to `output_dir/`:
+Each run writes to `output_dir/` (stored under `stuff/`, which is gitignored):
 
 ```
-output_beauty_icsr/
+stuff/output_beauty_icsr/
 ├── best_unified.pt     # Best validation checkpoint (submodular + encoder + RL)
 └── results.json        # Final test metrics: HR@k, NDCG@k, MRR@k, ILD, Coverage
 ```
+
+## Results (Amazon Beauty 2014 5-core, k=10)
+
+| Method | HR@10 | NDCG@10 | MRR@10 | ILD | Coverage |
+|--------|-------|---------|--------|-----|----------|
+| ICSRec top-10 greedy *(same pipeline)* | 0.0883 | — | — | 0.5126 | — |
+| **SRS (ours)** | **0.0899** | **0.0522** | **0.0407** | **0.5622** | **0.844** |
+
+*Full-catalogue baselines (different protocol): SASRec 0.0624, BERT4Rec 0.0601, ICSRec paper 0.0963.*
 
 ## Key Design Notes
 
 **Why no reranker (Stage 2)?**  
 ICSRec-SAS is a dense retriever trained with a full-softmax objective, so its inner-product similarity scores are already calibrated relevance estimates. Stage 2 is collapsed into Stage 1.
 
-**α_t vs η_t naming.**  
-The RL policy action has two dimensions. In `models/rl_policy.py` these are named `ALPHA_DIM` (α_t) and `KAPPA_DIM` (η_t — confusingly named `kappa` in the model to avoid clash with the kernel κ_θ). In pipeline code, the second action dimension is always referred to as `eta_t`.
+**Pluggable retriever.**  
+`TwoStageRLPipeline` accepts any retriever that implements `search_by_history` and `batch_search_by_history`. Swap `ICSRecRetriever` for `BERT4RecRetriever` or `BM25Retriever` without changing the RL/submodular code.
 
 **Target injection during training.**  
-`collect_transition` optionally injects the target item into the candidate pool at `top_score + 0.01` to ensure the hit signal is reachable even when retrieval recall is low (~20–25% at top-200).
+`collect_transition` optionally injects the target item into the candidate pool at `top_score + 0.01` to ensure the hit signal is reachable even when retrieval recall is low.

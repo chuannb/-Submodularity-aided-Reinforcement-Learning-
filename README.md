@@ -118,6 +118,8 @@ stuff/output_beauty_icsr/
 ├── best_unified.pt     # Best validation checkpoint (submodular + encoder + RL)
 └── results.json        # Final test metrics: HR@k, NDCG@k, MRR@k, ILD, Coverage
 ```
+## Checkpoint
+Save at huggingface: https://huggingface.co/mrr1ha/SRS-beauty-checkpoints
 
 ## Results (Amazon Beauty 2014 5-core, k=10)
 

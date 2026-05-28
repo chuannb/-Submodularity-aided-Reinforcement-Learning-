@@ -125,8 +125,8 @@ Save at huggingface: https://huggingface.co/mrr1ha/SRS-beauty-checkpoints
 
 | Method | HR@10 | NDCG@10 | MRR@10 | ILD | Coverage |
 |--------|-------|---------|--------|-----|----------|
-| ICSRec top-10 greedy *(same pipeline)* | 0.0883 | — | — | 0.5126 | — |
-| **SRS (ours)** | **0.0899** | **0.0522** | **0.0407** | **0.5622** | **0.844** |
+| ICSRec top-10 greedy *(same pipeline)* | 0.0959 | — | — | 0.5126 | — |
+| **SRS (ours)** | 0.0899 | **0.0522** | **0.0407** | **0.5622** | **0.844** |
 
 *Full-catalogue baselines (different protocol): SASRec 0.0624, BERT4Rec 0.0601, ICSRec paper 0.0963.*
 
